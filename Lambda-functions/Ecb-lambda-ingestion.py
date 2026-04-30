@@ -1,0 +1,67 @@
+import requests
+import csv
+import boto3
+import os
+import json
+from io import StringIO
+from datetime import datetime, timedelta
+
+s3 = boto3.client('s3')
+BUCKET_NAME = os.environ["BUCKET"]
+STATE_KEY = "status/ecb_state.json"
+
+SERIES = {"Japan": "JPY", "China": "CNY", "HongKong": "HKD", "India": "INR", "Singapore": "SGD"}
+
+def lambda_handler(event, context):
+    today = datetime.now().date()
+    
+    # --- START 3-DAY LOOKBACK LOGIC ---
+    try:
+        # 1. Try to read the previous state file
+        res = s3.get_object(Bucket=BUCKET_NAME, Key=STATE_KEY)
+        last_run_str = json.loads(res['Body'].read())['to_date']
+        
+        # 2. Subtract 3 days from the last run date for the 'next trigger'
+        from_date = datetime.strptime(last_run_str, '%Y-%m-%d').date() - timedelta(days=3)
+    except:
+        # If no state file exists (First Run), look back 60 days
+        from_date = today - timedelta(days=60)
+    # --- END 3-DAY LOOKBACK LOGIC ---
+
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Date", "EUR_Rate", "country"])
+
+    # Use the newer ECB API endpoint to avoid resolution errors
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    
+    for country, curr in SERIES.items():
+        # Updated URL with new host 'data-api.ecb.europa.eu'
+        url = f"https://data-api.ecb.europa.eu/service/data/EXR/D.{curr}.EUR.SP00.A?startPeriod={from_date}&endPeriod={today}&format=csvdata"
+        
+        try:
+            # Increased timeout to 15s to prevent ConnectionErrors
+            resp = requests.get(url, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                f = StringIO(resp.text)
+                reader = csv.DictReader(f)
+                for row in reader:
+                    # ECB SDMX-CSV uses 'TIME_PERIOD' and 'OBS_VALUE'
+                    writer.writerow([row['TIME_PERIOD'], row['OBS_VALUE'], country])
+        except Exception as e:
+            print(f"Error fetching {country}: {e}")
+
+    # 3. Save Data and ALWAYS update the state file
+    s3.put_object(
+        Bucket=BUCKET_NAME, 
+        Key=f"ecb/ecb_{today}.csv", 
+        Body=output.getvalue()
+    )
+    
+    s3.put_object(
+        Bucket=BUCKET_NAME, 
+        Key=STATE_KEY, 
+        Body=json.dumps({"to_date": str(today)})
+    )
+    
+    return {"status": "success", "from_date": str(from_date), "to_date": str(today)}
